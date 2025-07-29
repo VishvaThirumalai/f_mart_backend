@@ -3,14 +3,146 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const bodyParser = require('body-parser');
+const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// ========== MongoDB Connection ==========
+mongoose.connect(process.env.MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  dbName: 'freshmart' // 👈 Add this
+})
+.then(() => console.log('MongoDB connected'))
+.catch(err => {
+  console.error('MongoDB connection error:', err);
+  process.exit(1);
+});
+
+// ========== MongoDB Schemas & Models ==========
+const UserSchema = new mongoose.Schema({
+  name: { 
+    type: String, 
+    required: true,
+    trim: true,
+    minlength: 2
+  },
+  email: { 
+    type: String, 
+    required: true, 
+    unique: true,
+    lowercase: true,
+    match: [/^\S+@\S+\.\S+$/, 'Invalid email format']
+  },
+  password: { 
+    type: String, 
+    required: true,
+    minlength: 6
+  },
+  createdAt: { 
+    type: Date, 
+    default: Date.now 
+  }
+});
+
+UserSchema.pre('save', async function(next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, 12);
+  next();
+});
+
+const CartItemSchema = new mongoose.Schema({
+  productId: {
+    type: String,
+    required: true
+  },
+  name: {
+    type: String,
+    required: true
+  },
+  price: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  image: String,
+  quantity: {
+    type: Number,
+    required: true,
+    min: 1,
+    default: 1
+  },
+  addedAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+const CartSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true,
+    unique: true
+  },
+  items: [CartItemSchema],
+  clearedAt: Date
+});
+
+const OrderItemSchema = new mongoose.Schema({
+  productId: String,
+  name: String,
+  price: Number,
+  quantity: Number,
+  image: String
+});
+
+const OrderSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  items: [OrderItemSchema],
+  totalAmount: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  deliveryAddress: {
+    type: String,
+    required: true
+  },
+  paymentMethod: {
+    type: String,
+    required: true,
+    enum: ['card', 'cash', 'paypal', 'other']
+  },
+  notes: String,
+  status: {
+    type: String,
+    default: 'confirmed',
+    enum: ['confirmed', 'processing', 'shipped', 'delivered', 'cancelled']
+  },
+  orderDate: {
+    type: Date,
+    default: Date.now
+  },
+  estimatedDelivery: Date,
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  cancelledAt: Date,
+  cancellationReason: String
+});
+
+const User = mongoose.model('User', UserSchema);
+const Cart = mongoose.model('Cart', CartSchema);
+const Order = mongoose.model('Order', OrderSchema);
 
 // ========== Middleware Setup ==========
 app.use(helmet());
@@ -32,59 +164,23 @@ const limiter = rateLimit({
 });
 app.use('/api', limiter);
 
-// ========== Data Management ==========
-const DATA_DIR = path.join(__dirname, 'data');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const CARTS_FILE = path.join(DATA_DIR, 'carts.json');
-const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
-
-// Initialize data directory
-const initializeData = () => {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  
-  [USERS_FILE, CARTS_FILE, ORDERS_FILE].forEach(file => {
-    if (!fs.existsSync(file)) {
-      fs.writeFileSync(file, JSON.stringify([], null, 2));
-    }
-  });
-};
-
-// Data helpers
-const readData = (file) => {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (err) {
-    console.error(`Error reading ${file}:`, err);
-    return [];
-  }
-};
-
-const writeData = (file, data) => {
-  try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
-    return true;
-  } catch (err) {
-    console.error(`Error writing ${file}:`, err);
-    return false;
-  }
-};
-
 // ========== Authentication ==========
 const jwtConfig = {
   expiresIn: '7d',
   issuer: 'freshmart-api'
 };
 
-const authenticate = (req, res, next) => {
+const authenticate = async (req, res, next) => {
   if (req.method === 'OPTIONS') return next();
 
   try {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) throw new Error('No token provided');
     
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = await User.findById(decoded.id).select('-password');
+    
+    if (!req.user) throw new Error('User not found');
     next();
   } catch (err) {
     res.status(401).json({
@@ -109,56 +205,22 @@ app.post('/api/register', async (req, res) => {
       });
     }
 
-    if (name.trim().length < 2) {
-      return res.status(400).json({
-        success: false,
-        message: 'Name must be at least 2 characters'
-      });
-    }
-
-    if (!/^\S+@\S+\.\S+$/.test(email)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid email format'
-      });
-    }
-
-    if (password.length < 6) {
-      return res.status(400).json({
-        success: false,
-        message: 'Password must be at least 6 characters'
-      });
-    }
-
-    const users = readData(USERS_FILE);
-    if (users.some(u => u.email.toLowerCase() === email.toLowerCase())) {
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser) {
       return res.status(400).json({
         success: false,
         message: 'Email already registered'
       });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 12);
-    const newUser = {
-      id: Date.now(),
-      name: name.trim(),
-      email: email.toLowerCase(),
-      password: hashedPassword,
-      createdAt: new Date().toISOString()
-    };
+    const newUser = new User({ name, email, password });
+    await newUser.save();
 
-    users.push(newUser);
-    if (!writeData(USERS_FILE, users)) {
-      throw new Error('Failed to save user data');
-    }
-
-    // Initialize cart
-    const carts = readData(CARTS_FILE);
-    carts.push({ userId: newUser.id, items: [] });
-    writeData(CARTS_FILE, carts);
+    // Create empty cart for user
+    await Cart.create({ userId: newUser._id, items: [] });
 
     const token = jwt.sign(
-      { id: newUser.id, email: newUser.email },
+      { id: newUser._id, email: newUser.email },
       process.env.JWT_SECRET,
       jwtConfig
     );
@@ -167,7 +229,7 @@ app.post('/api/register', async (req, res) => {
       success: true,
       message: 'Registration successful',
       user: {
-        id: newUser.id,
+        id: newUser._id,
         name: newUser.name,
         email: newUser.email
       },
@@ -193,9 +255,7 @@ app.post('/api/login', async (req, res) => {
       });
     }
 
-    const users = readData(USERS_FILE);
-    const user = users.find(u => u.email.toLowerCase() === email.toLowerCase());
-
+    const user = await User.findOne({ email: email.toLowerCase() });
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({
         success: false,
@@ -204,7 +264,7 @@ app.post('/api/login', async (req, res) => {
     }
 
     const token = jwt.sign(
-      { id: user.id, email: user.email },
+      { id: user._id, email: user.email },
       process.env.JWT_SECRET,
       jwtConfig
     );
@@ -213,7 +273,7 @@ app.post('/api/login', async (req, res) => {
       success: true,
       message: 'Login successful',
       user: {
-        id: user.id,
+        id: user._id,
         name: user.name,
         email: user.email
       },
@@ -231,16 +291,28 @@ app.post('/api/login', async (req, res) => {
 // ========== CART ROUTES ==========
 
 // Get user cart
-app.get('/api/cart', authenticate, (req, res) => {
+app.get('/api/cart', authenticate, async (req, res) => {
   try {
-    const carts = readData(CARTS_FILE);
-    const userCart = carts.find(c => c.userId === req.user.id) || { userId: req.user.id, items: [] };
+    const cart = await Cart.findOne({ userId: req.user._id });
+    
+    if (!cart) {
+      const newCart = await Cart.create({ userId: req.user._id, items: [] });
+      return res.json({ 
+        success: true, 
+        items: newCart.items,
+        totalItems: 0,
+        totalPrice: 0
+      });
+    }
+    
+    const totalItems = cart.items.reduce((sum, item) => sum + item.quantity, 0);
+    const totalPrice = cart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
     
     res.json({ 
       success: true, 
-      items: userCart.items || [],
-      totalItems: userCart.items?.reduce((sum, item) => sum + item.quantity, 0) || 0,
-      totalPrice: userCart.items?.reduce((sum, item) => sum + (item.price * item.quantity), 0) || 0
+      items: cart.items,
+      totalItems,
+      totalPrice
     });
   } catch (err) {
     console.error('Cart fetch error:', err);
@@ -252,7 +324,7 @@ app.get('/api/cart', authenticate, (req, res) => {
 });
 
 // Add item to cart
-app.post('/api/cart', authenticate, (req, res) => {
+app.post('/api/cart', authenticate, async (req, res) => {
   try {
     const { productId, name, price, image, quantity = 1 } = req.body;
     
@@ -271,42 +343,37 @@ app.post('/api/cart', authenticate, (req, res) => {
       });
     }
 
-    const carts = readData(CARTS_FILE);
-    let userCart = carts.find(c => c.userId === req.user.id);
+    let cart = await Cart.findOne({ userId: req.user._id });
     
-    if (!userCart) {
-      userCart = { userId: req.user.id, items: [] };
-      carts.push(userCart);
+    if (!cart) {
+      cart = await Cart.create({ userId: req.user._id, items: [] });
     }
 
-    const existingItemIndex = userCart.items.findIndex(item => item.productId == productId);
+    const existingItemIndex = cart.items.findIndex(item => 
+      item.productId.toString() === productId.toString()
+    );
     
     if (existingItemIndex !== -1) {
-      // Update existing item quantity
-      userCart.items[existingItemIndex].quantity += quantity;
+      cart.items[existingItemIndex].quantity += quantity;
     } else {
-      // Add new item
-      userCart.items.push({ 
-        productId: productId.toString(), 
+      cart.items.push({ 
+        productId, 
         name, 
-        price: parseFloat(price), 
+        price, 
         image, 
-        quantity: parseInt(quantity),
-        addedAt: new Date().toISOString()
+        quantity 
       });
     }
 
-    if (!writeData(CARTS_FILE, carts)) {
-      throw new Error('Failed to update cart');
-    }
+    await cart.save();
 
-    const totalItems = userCart.items.reduce((sum, item) => sum + item.quantity, 0);
-    const totalPrice = userCart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    const totalItems = cart.items.reduce((sum, item) => sum + item.quantity, 0);
+    const totalPrice = cart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
 
     res.json({ 
       success: true, 
       message: 'Item added to cart successfully',
-      items: userCart.items,
+      items: cart.items,
       totalItems,
       totalPrice
     });
@@ -320,29 +387,30 @@ app.post('/api/cart', authenticate, (req, res) => {
 });
 
 // Update item quantity in cart
-app.put('/api/cart/:productId', authenticate, (req, res) => {
+app.put('/api/cart/:productId', authenticate, async (req, res) => {
   try {
     const { productId } = req.params;
     const { quantity } = req.body;
     
-    if (!quantity || quantity < 0) {
+    if (quantity === undefined || quantity < 0) {
       return res.status(400).json({
         success: false,
         message: 'Valid quantity is required'
       });
     }
 
-    const carts = readData(CARTS_FILE);
-    const userCart = carts.find(c => c.userId === req.user.id);
+    const cart = await Cart.findOne({ userId: req.user._id });
     
-    if (!userCart) {
+    if (!cart) {
       return res.status(404).json({
         success: false,
         message: 'Cart not found'
       });
     }
 
-    const itemIndex = userCart.items.findIndex(item => item.productId == productId);
+    const itemIndex = cart.items.findIndex(item => 
+      item.productId.toString() === productId.toString()
+    );
     
     if (itemIndex === -1) {
       return res.status(404).json({
@@ -352,25 +420,20 @@ app.put('/api/cart/:productId', authenticate, (req, res) => {
     }
 
     if (quantity === 0) {
-      // Remove item if quantity is 0
-      userCart.items.splice(itemIndex, 1);
+      cart.items.splice(itemIndex, 1);
     } else {
-      // Update quantity
-      userCart.items[itemIndex].quantity = parseInt(quantity);
-      userCart.items[itemIndex].updatedAt = new Date().toISOString();
+      cart.items[itemIndex].quantity = quantity;
     }
     
-    if (!writeData(CARTS_FILE, carts)) {
-      throw new Error('Failed to update cart');
-    }
+    await cart.save();
 
-    const totalItems = userCart.items.reduce((sum, item) => sum + item.quantity, 0);
-    const totalPrice = userCart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    const totalItems = cart.items.reduce((sum, item) => sum + item.quantity, 0);
+    const totalPrice = cart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
 
     res.json({ 
       success: true, 
       message: quantity === 0 ? 'Item removed from cart' : 'Cart updated successfully',
-      items: userCart.items,
+      items: cart.items,
       totalItems,
       totalPrice
     });
@@ -384,40 +447,39 @@ app.put('/api/cart/:productId', authenticate, (req, res) => {
 });
 
 // Remove specific item from cart
-app.delete('/api/cart/:productId', authenticate, (req, res) => {
+app.delete('/api/cart/:productId', authenticate, async (req, res) => {
   try {
     const { productId } = req.params;
-    const carts = readData(CARTS_FILE);
+    const cart = await Cart.findOne({ userId: req.user._id });
     
-    const userCart = carts.find(c => c.userId === req.user.id);
-    if (!userCart) {
+    if (!cart) {
       return res.status(404).json({
         success: false,
         message: 'Cart not found'
       });
     }
 
-    const initialLength = userCart.items.length;
-    userCart.items = userCart.items.filter(item => item.productId != productId);
+    const initialLength = cart.items.length;
+    cart.items = cart.items.filter(item => 
+      item.productId.toString() !== productId.toString()
+    );
     
-    if (userCart.items.length === initialLength) {
+    if (cart.items.length === initialLength) {
       return res.status(404).json({
         success: false,
         message: 'Item not found in cart'
       });
     }
     
-    if (!writeData(CARTS_FILE, carts)) {
-      throw new Error('Failed to update cart');
-    }
+    await cart.save();
 
-    const totalItems = userCart.items.reduce((sum, item) => sum + item.quantity, 0);
-    const totalPrice = userCart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    const totalItems = cart.items.reduce((sum, item) => sum + item.quantity, 0);
+    const totalPrice = cart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
 
     res.json({ 
       success: true, 
       message: 'Item removed from cart successfully',
-      items: userCart.items,
+      items: cart.items,
       totalItems,
       totalPrice
     });
@@ -431,24 +493,20 @@ app.delete('/api/cart/:productId', authenticate, (req, res) => {
 });
 
 // Clear entire cart
-app.delete('/api/cart', authenticate, (req, res) => {
+app.delete('/api/cart', authenticate, async (req, res) => {
   try {
-    const carts = readData(CARTS_FILE);
-    const userCart = carts.find(c => c.userId === req.user.id);
+    const cart = await Cart.findOne({ userId: req.user._id });
     
-    if (!userCart) {
+    if (!cart) {
       return res.status(404).json({
         success: false,
         message: 'Cart not found'
       });
     }
 
-    userCart.items = [];
-    userCart.clearedAt = new Date().toISOString();
-    
-    if (!writeData(CARTS_FILE, carts)) {
-      throw new Error('Failed to clear cart');
-    }
+    cart.items = [];
+    cart.clearedAt = Date.now();
+    await cart.save();
 
     res.json({ 
       success: true, 
@@ -469,18 +527,16 @@ app.delete('/api/cart', authenticate, (req, res) => {
 // ========== ORDER ROUTES ==========
 
 // Get user orders
-app.get('/api/orders', authenticate, (req, res) => {
+app.get('/api/orders', authenticate, async (req, res) => {
   try {
-    const orders = readData(ORDERS_FILE);
-    const userOrders = orders.filter(order => order.userId === req.user.id);
-    
-    // Sort by order date (newest first)
-    userOrders.sort((a, b) => new Date(b.orderDate) - new Date(a.orderDate));
-    
+    const orders = await Order.find({ userId: req.user._id })
+      .sort({ orderDate: -1 })
+      .lean();
+
     res.json({
       success: true,
-      orders: userOrders,
-      total: userOrders.length
+      orders,
+      total: orders.length
     });
   } catch (err) {
     console.error('Orders fetch error:', err);
@@ -492,7 +548,7 @@ app.get('/api/orders', authenticate, (req, res) => {
 });
 
 // Create new order
-app.post('/api/orders', authenticate, (req, res) => {
+app.post('/api/orders', authenticate, async (req, res) => {
   try {
     const { items, deliveryAddress, paymentMethod, notes } = req.body;
     
@@ -513,41 +569,30 @@ app.post('/api/orders', authenticate, (req, res) => {
     const totalAmount = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
     const orderId = `FM${Date.now()}${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
     
-    const newOrder = {
+    const newOrder = new Order({
       id: orderId,
-      userId: req.user.id,
+      userId: req.user._id,
       items: items.map(item => ({
         productId: item.productId,
         name: item.name,
-        price: parseFloat(item.price),
-        quantity: parseInt(item.quantity),
+        price: item.price,
+        quantity: item.quantity,
         image: item.image
       })),
       totalAmount: parseFloat(totalAmount.toFixed(2)),
       deliveryAddress,
       paymentMethod,
       notes: notes || '',
-      status: 'confirmed',
-      orderDate: new Date().toISOString(),
-      estimatedDelivery: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours from now
-      createdAt: new Date().toISOString()
-    };
+      estimatedDelivery: new Date(Date.now() + 24 * 60 * 60 * 1000)
+    });
 
-    const orders = readData(ORDERS_FILE);
-    orders.push(newOrder);
-    
-    if (!writeData(ORDERS_FILE, orders)) {
-      throw new Error('Failed to save order');
-    }
+    await newOrder.save();
 
-    // Clear user's cart after successful order
-    const carts = readData(CARTS_FILE);
-    const userCart = carts.find(c => c.userId === req.user.id);
-    if (userCart) {
-      userCart.items = [];
-      userCart.clearedAt = new Date().toISOString();
-      writeData(CARTS_FILE, carts);
-    }
+    // Clear user's cart
+    await Cart.updateOne(
+      { userId: req.user._id },
+      { $set: { items: [], clearedAt: Date.now() } }
+    );
 
     res.status(201).json({
       success: true,
@@ -564,25 +609,23 @@ app.post('/api/orders', authenticate, (req, res) => {
 });
 
 // Cancel order
-app.put('/api/orders/:orderId/cancel', authenticate, (req, res) => {
+app.put('/api/orders/:orderId/cancel', authenticate, async (req, res) => {
   try {
     const { orderId } = req.params;
     const { reason } = req.body;
     
-    const orders = readData(ORDERS_FILE);
-    const orderIndex = orders.findIndex(order => 
-      order.id === orderId && order.userId === req.user.id
-    );
+    const order = await Order.findOne({ 
+      id: orderId,
+      userId: req.user._id
+    });
     
-    if (orderIndex === -1) {
+    if (!order) {
       return res.status(404).json({
         success: false,
         message: 'Order not found'
       });
     }
 
-    const order = orders[orderIndex];
-    
     // Check if order can be cancelled
     if (['delivered', 'cancelled'].includes(order.status.toLowerCase())) {
       return res.status(400).json({
@@ -591,23 +634,16 @@ app.put('/api/orders/:orderId/cancel', authenticate, (req, res) => {
       });
     }
 
-    // Update order status
-    orders[orderIndex] = {
-      ...order,
-      status: 'cancelled',
-      cancelledAt: new Date().toISOString(),
-      cancellationReason: reason || 'Cancelled by customer',
-      updatedAt: new Date().toISOString()
-    };
+    order.status = 'cancelled';
+    order.cancelledAt = Date.now();
+    order.cancellationReason = reason || 'Cancelled by customer';
     
-    if (!writeData(ORDERS_FILE, orders)) {
-      throw new Error('Failed to update order');
-    }
+    await order.save();
 
     res.json({
       success: true,
       message: 'Order cancelled successfully',
-      order: orders[orderIndex]
+      order
     });
   } catch (err) {
     console.error('Order cancellation error:', err);
@@ -619,14 +655,14 @@ app.put('/api/orders/:orderId/cancel', authenticate, (req, res) => {
 });
 
 // Get specific order details
-app.get('/api/orders/:orderId', authenticate, (req, res) => {
+app.get('/api/orders/:orderId', authenticate, async (req, res) => {
   try {
     const { orderId } = req.params;
-    const orders = readData(ORDERS_FILE);
     
-    const order = orders.find(order => 
-      order.id === orderId && order.userId === req.user.id
-    );
+    const order = await Order.findOne({ 
+      id: orderId,
+      userId: req.user._id
+    });
     
     if (!order) {
       return res.status(404).json({
@@ -669,15 +705,12 @@ app.get('/api/health', (req, res) => {
   res.json({
     success: true,
     message: 'Server is healthy',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    database: mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected'
   });
 });
-app.get("/", (req, res) => {
-  res.send("Welcome to FreshMart API! Use /api for endpoints.");
-});
 
-// Initialize and start server
-initializeData();
+// Start server
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔗 API: http://localhost:${PORT}/api`);
