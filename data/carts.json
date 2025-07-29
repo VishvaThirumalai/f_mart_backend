@@ -20,5 +20,18 @@
   {
     "userId": 1753603420371,
     "items": []
+  },
+  {
+    "userId": "68884f27802c8cbf5592f18f",
+    "items": [
+      {
+        "productId": "2",
+        "name": "Organic Apples",
+        "price": 120,
+        "image": "/static/media/fresh-apples.270ff1baada426f8a29c.jpg",
+        "quantity": 1,
+        "addedAt": "2025-07-29T04:48:11.658Z"
+      }
+    ]
   }
 ]
